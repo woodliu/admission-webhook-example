@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: etcd
+  labels:
+    app: etcd
+spec:
+  ports:
+  - port: 3380
+    name: etcd-server
+  - port: 3379
+    name: etcd-client
+  clusterIP: None
+  selector:
+    app: etcd
+  publishNotReadyAddresses: true
+

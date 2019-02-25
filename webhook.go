@@ -5,64 +5,31 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/http"
-	"strings"
-
 	"github.com/golang/glog"
+	"github.com/coreos/etcd/clientv3"
 	"k8s.io/api/admission/v1beta1"
 	admissionregistrationv1beta1 "k8s.io/api/admissionregistration/v1beta1"
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/kubernetes/pkg/apis/core/v1"
+	"time"
+	"context"
 )
 
 var (
 	runtimeScheme = runtime.NewScheme()
 	codecs        = serializer.NewCodecFactory(runtimeScheme)
 	deserializer  = codecs.UniversalDeserializer()
-
-	// (https://github.com/kubernetes/kubernetes/issues/57982)
-	defaulter = runtime.ObjectDefaulter(runtimeScheme)
-)
-
-var (
-	ignoredNamespaces = []string{
-		metav1.NamespaceSystem,
-		metav1.NamespacePublic,
-	}
-	requiredLabels = []string{
-		nameLabel,
-		instanceLabel,
-		versionLabel,
-		componentLabel,
-		partOfLabel,
-		managedByLabel,
-	}
-	addLabels = map[string]string{
-		nameLabel:      NA,
-		instanceLabel:  NA,
-		versionLabel:   NA,
-		componentLabel: NA,
-		partOfLabel:    NA,
-		managedByLabel: NA,
-	}
 )
 
 const (
 	admissionWebhookAnnotationValidateKey = "admission-webhook-example.banzaicloud.com/validate"
-	admissionWebhookAnnotationMutateKey   = "admission-webhook-example.banzaicloud.com/mutate"
 	admissionWebhookAnnotationStatusKey   = "admission-webhook-example.banzaicloud.com/status"
 
-	nameLabel      = "app.kubernetes.io/name"
-	instanceLabel  = "app.kubernetes.io/instance"
-	versionLabel   = "app.kubernetes.io/version"
-	componentLabel = "app.kubernetes.io/component"
-	partOfLabel    = "app.kubernetes.io/part-of"
-	managedByLabel = "app.kubernetes.io/managed-by"
-
-	NA = "not_available"
+	etcdEndpoints        = "etcd:2379"
+	etcdPodPrefix        = "etcd" /*use this rule to check if a pod is etcd pod */
 )
 
 type WebhookServer struct {
@@ -74,13 +41,6 @@ type WhSvrParameters struct {
 	port           int    // webhook server port
 	certFile       string // path to the x509 certificate for https
 	keyFile        string // path to the x509 private key matching `CertFile`
-	sidecarCfgFile string // path to sidecar injector configuration file
-}
-
-type patchOperation struct {
-	Op    string      `json:"op"`
-	Path  string      `json:"path"`
-	Value interface{} `json:"value,omitempty"`
 }
 
 func init() {
@@ -91,228 +51,119 @@ func init() {
 	_ = v1.AddToScheme(runtimeScheme)
 }
 
-func admissionRequired(ignoredList []string, admissionAnnotationKey string, metadata *metav1.ObjectMeta) bool {
-	// skip special kubernetes system namespaces
-	for _, namespace := range ignoredList {
-		if metadata.Namespace == namespace {
-			glog.Infof("Skip validation for %v for it's in special namespace:%v", metadata.Name, metadata.Namespace)
-			return false
-		}
-	}
-
-	annotations := metadata.GetAnnotations()
-	if annotations == nil {
-		annotations = map[string]string{}
-	}
-
-	var required bool
-	switch strings.ToLower(annotations[admissionAnnotationKey]) {
-	default:
-		required = true
-	case "n", "no", "false", "off":
-		required = false
-	}
-	return required
-}
-
-func mutationRequired(ignoredList []string, metadata *metav1.ObjectMeta) bool {
-	required := admissionRequired(ignoredList, admissionWebhookAnnotationMutateKey, metadata)
-	annotations := metadata.GetAnnotations()
-	if annotations == nil {
-		annotations = map[string]string{}
-	}
-	status := annotations[admissionWebhookAnnotationStatusKey]
-
-	if strings.ToLower(status) == "mutated" {
-		required = false
-	}
-
-	glog.Infof("Mutation policy for %v/%v: required:%v", metadata.Namespace, metadata.Name, required)
-	return required
-}
-
-func validationRequired(ignoredList []string, metadata *metav1.ObjectMeta) bool {
-	required := admissionRequired(ignoredList, admissionWebhookAnnotationValidateKey, metadata)
-	glog.Infof("Validation policy for %v/%v: required:%v", metadata.Namespace, metadata.Name, required)
-	return required
-}
-
-func updateAnnotation(target map[string]string, added map[string]string) (patch []patchOperation) {
-	for key, value := range added {
-		if target == nil || target[key] == "" {
-			target = map[string]string{}
-			patch = append(patch, patchOperation{
-				Op:   "add",
-				Path: "/metadata/annotations",
-				Value: map[string]string{
-					key: value,
-				},
-			})
-		} else {
-			patch = append(patch, patchOperation{
-				Op:    "replace",
-				Path:  "/metadata/annotations/" + key,
-				Value: value,
-			})
-		}
-	}
-	return patch
-}
-
-func updateLabels(target map[string]string, added map[string]string) (patch []patchOperation) {
-	values := make(map[string]string)
-	for key, value := range added {
-		if target == nil || target[key] == "" {
-			values[key] = value
-		}
-	}
-	patch = append(patch, patchOperation{
-		Op:    "add",
-		Path:  "/metadata/labels",
-		Value: values,
-	})
-	return patch
-}
-
-func createPatch(availableAnnotations map[string]string, annotations map[string]string, availableLabels map[string]string, labels map[string]string) ([]byte, error) {
-	var patch []patchOperation
-
-	patch = append(patch, updateAnnotation(availableAnnotations, annotations)...)
-	patch = append(patch, updateLabels(availableLabels, labels)...)
-
-	return json.Marshal(patch)
+func HasPrefix(s, prefix string) bool {
+	return len(s) >= len(prefix) && s[0:len(prefix)] == prefix
 }
 
 // validate deployments and services
 func (whsvr *WebhookServer) validate(ar *v1beta1.AdmissionReview) *v1beta1.AdmissionResponse {
 	req := ar.Request
 	var (
-		availableLabels                 map[string]string
-		objectMeta                      *metav1.ObjectMeta
-		resourceNamespace, resourceName string
+	    result    *metav1.Status
+		allowed   bool
+		deletePodName string
+		deletePodId uint64
+		memberlistNum int
 	)
-
+    //default forbident deleting any pod
+	allowed = false
 	glog.Infof("AdmissionReview for Kind=%v, Namespace=%v Name=%v (%v) UID=%v patchOperation=%v UserInfo=%v",
-		req.Kind, req.Namespace, req.Name, resourceName, req.UID, req.Operation, req.UserInfo)
+		req.Kind, req.Namespace, req.Name, req.UID, req.Operation, req.UserInfo)
 
 	switch req.Kind.Kind {
-	case "Deployment":
-		var deployment appsv1.Deployment
-		if err := json.Unmarshal(req.Object.Raw, &deployment); err != nil {
-			glog.Errorf("Could not unmarshal raw object: %v", err)
+	case "Pod":
+	        pod := corev1.Pod{}
+		deserializer := codecs.UniversalDeserializer()
+		if _, _, err := deserializer.Decode(ar.Request.Object.Raw, nil, &pod); err != nil {
+			glog.Errorf("Could not Decode raw object: %v", err)
 			return &v1beta1.AdmissionResponse{
 				Result: &metav1.Status{
 					Message: err.Error(),
 				},
 			}
 		}
-		resourceName, resourceNamespace, objectMeta = deployment.Name, deployment.Namespace, &deployment.ObjectMeta
-		availableLabels = deployment.Labels
-	case "Service":
-		var service corev1.Service
-		if err := json.Unmarshal(req.Object.Raw, &service); err != nil {
-			glog.Errorf("Could not unmarshal raw object: %v", err)
-			return &v1beta1.AdmissionResponse{
-				Result: &metav1.Status{
-					Message: err.Error(),
-				},
+
+		deletePodName = req.Name
+		if false == HasPrefix(deletePodName, etcdPodPrefix){
+			allowed = true
+			glog.Info("not etcd pod,allow to delete")
+			result = &metav1.Status{
+				Reason: "not etcd pod,allow to delete",
+			}
+			goto EXIT
+		}
+
+		cli, err := clientv3.New(clientv3.Config{
+			Endpoints:   []string{etcdEndpoints},
+			DialTimeout: 5 * time.Second,
+		})
+		if err != nil {
+			glog.Errorf("etcd cientv3 New failed,etcd may not started or etcd endpoint is wrong: %v", err)
+			result = &metav1.Status{
+				Reason: "etcd cientv3 New failed,etcd may not started or etcd endpoint is wrong",
+			}
+			goto EXIT
+		}
+		defer cli.Close()
+		mapi := clientv3.NewMaintenance(cli)
+		status, err := mapi.Status(context.Background(), etcdEndpoints)
+		if err != nil {
+			glog.Errorf("get etcd cientv3 status failed: %v", err)
+			result = &metav1.Status{
+				Reason: "get etcd cientv3 status failed",
+			}
+			goto EXIT
+		}
+
+		leaderId := status.Leader
+		memberlist, err1 := cli.MemberList(context.Background())
+		if err1 != nil {
+			glog.Errorf("get memberlist failed: %v", err1)
+			result = &metav1.Status{
+				Reason: "get memberlist failed",
+			}
+			goto EXIT
+		}
+
+		memberlistNum = len(memberlist.Members)
+		for _,v := range memberlist.Members {
+			if v.Name == deletePodName {
+				deletePodId = v.ID
+				break
 			}
 		}
-		resourceName, resourceNamespace, objectMeta = service.Name, service.Namespace, &service.ObjectMeta
-		availableLabels = service.Labels
-	}
 
-	if !validationRequired(ignoredNamespaces, objectMeta) {
-		glog.Infof("Skipping validation for %s/%s due to policy check", resourceNamespace, resourceName)
-		return &v1beta1.AdmissionResponse{
-			Allowed: true,
+
+		glog.Infof("leaderId is: %v", leaderId)
+		glog.Infof("deletePodId: %v", deletePodId)
+		glog.Infof("status: %v", status)
+		glog.Infof("memberlist.Members is: %v", memberlist.Members)
+
+		glog.Infof("req is: %v", req)
+		glog.Infof("raw is: %v", req.Object.Raw)
+		glog.Infof("pod is: %+v", pod)
+
+		if deletePodId == 0 {
+			result = &metav1.Status{
+				Reason: "get deletePodId error",
+			}
+			goto EXIT
 		}
-	}
-
-	allowed := true
-	var result *metav1.Status
-	glog.Info("available labels:", availableLabels)
-	glog.Info("required labels", requiredLabels)
-	for _, rl := range requiredLabels {
-		if _, ok := availableLabels[rl]; !ok {
+		//delete pod when it is not leader or there is just one member
+		if deletePodId != leaderId || memberlistNum == 1  {
+			allowed = true
+		}else {
 			allowed = false
 			result = &metav1.Status{
-				Reason: "required labels are not set",
+				Reason: "delete pod forbidented!",
 			}
-			break
 		}
 	}
 
+	EXIT:
 	return &v1beta1.AdmissionResponse{
 		Allowed: allowed,
 		Result:  result,
-	}
-}
-
-// main mutation process
-func (whsvr *WebhookServer) mutate(ar *v1beta1.AdmissionReview) *v1beta1.AdmissionResponse {
-	req := ar.Request
-	var (
-		availableLabels, availableAnnotations map[string]string
-		objectMeta                            *metav1.ObjectMeta
-		resourceNamespace, resourceName       string
-	)
-
-	glog.Infof("AdmissionReview for Kind=%v, Namespace=%v Name=%v (%v) UID=%v patchOperation=%v UserInfo=%v",
-		req.Kind, req.Namespace, req.Name, resourceName, req.UID, req.Operation, req.UserInfo)
-
-	switch req.Kind.Kind {
-	case "Deployment":
-		var deployment appsv1.Deployment
-		if err := json.Unmarshal(req.Object.Raw, &deployment); err != nil {
-			glog.Errorf("Could not unmarshal raw object: %v", err)
-			return &v1beta1.AdmissionResponse{
-				Result: &metav1.Status{
-					Message: err.Error(),
-				},
-			}
-		}
-		resourceName, resourceNamespace, objectMeta = deployment.Name, deployment.Namespace, &deployment.ObjectMeta
-		availableLabels = deployment.Labels
-	case "Service":
-		var service corev1.Service
-		if err := json.Unmarshal(req.Object.Raw, &service); err != nil {
-			glog.Errorf("Could not unmarshal raw object: %v", err)
-			return &v1beta1.AdmissionResponse{
-				Result: &metav1.Status{
-					Message: err.Error(),
-				},
-			}
-		}
-		resourceName, resourceNamespace, objectMeta = service.Name, service.Namespace, &service.ObjectMeta
-		availableLabels = service.Labels
-	}
-
-	if !mutationRequired(ignoredNamespaces, objectMeta) {
-		glog.Infof("Skipping validation for %s/%s due to policy check", resourceNamespace, resourceName)
-		return &v1beta1.AdmissionResponse{
-			Allowed: true,
-		}
-	}
-
-	annotations := map[string]string{admissionWebhookAnnotationStatusKey: "mutated"}
-	patchBytes, err := createPatch(availableAnnotations, annotations, availableLabels, addLabels)
-	if err != nil {
-		return &v1beta1.AdmissionResponse{
-			Result: &metav1.Status{
-				Message: err.Error(),
-			},
-		}
-	}
-
-	glog.Infof("AdmissionResponse: patch=%v\n", string(patchBytes))
-	return &v1beta1.AdmissionResponse{
-		Allowed: true,
-		Patch:   patchBytes,
-		PatchType: func() *v1beta1.PatchType {
-			pt := v1beta1.PatchTypeJSONPatch
-			return &pt
-		}(),
 	}
 }
 
@@ -349,9 +200,7 @@ func (whsvr *WebhookServer) serve(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		fmt.Println(r.URL.Path)
-		if r.URL.Path == "/mutate" {
-			admissionResponse = whsvr.mutate(&ar)
-		} else if r.URL.Path == "/validate" {
+		if r.URL.Path == "/validate" {
 			admissionResponse = whsvr.validate(&ar)
 		}
 	}
@@ -375,3 +224,4 @@ func (whsvr *WebhookServer) serve(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("could not write response: %v", err), http.StatusInternalServerError)
 	}
 }
+

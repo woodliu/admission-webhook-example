@@ -3,6 +3,10 @@
   name = "github.com/golang/glog"
 
 [[constraint]]
+  branch = "master"
+  name = "github.com/coreos/etcd"
+
+[[constraint]]
   name = "k8s.io/api"
   branch = "release-1.10"
 
